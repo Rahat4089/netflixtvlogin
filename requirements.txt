@@ -1,0 +1,7 @@
+flask 
+flask-session 
+requests 
+beautifulsoup4 
+pymongo 
+dnspython 
+zipfile36
