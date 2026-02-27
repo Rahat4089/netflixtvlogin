@@ -521,7 +521,12 @@ def check_cookie_sync(netflix_id, auto_delete_invalid=True):
         # Normalize video quality
         normalized_quality = normalize_video_quality(video_quality)
         
-        # Create account data
+        # Get existing document to preserve is_used status
+        existing = cookies_collection.find_one({'netflix_id': netflix_id})
+        is_used = existing.get('is_used', False) if existing else False
+        used_at = existing.get('used_at') if existing else None
+        
+        # Create account data - preserve is_used status
         account_data = {
             'netflix_id': netflix_id,
             'is_valid': is_valid,
@@ -547,7 +552,8 @@ def check_cookie_sync(netflix_id, auto_delete_invalid=True):
             'connected_profiles': connected_profiles_count,
             'profiles': profiles_str,
             'last_checked': datetime.utcnow(),
-            'is_used': False
+            'is_used': is_used,  # Preserve existing is_used value
+            'used_at': used_at   # Preserve existing used_at value
         }
         
         return {'ok': is_valid, 'data': account_data}
@@ -597,7 +603,7 @@ def perform_tv_login(session, auth_url, tv_code):
         }
         
         response = session.post('https://www.netflix.com/tv2', headers=headers, data=data, allow_redirects=False, timeout=15)
-
+        
         if response.status_code == 302 and response.headers.get('location') == 'https://www.netflix.com/tv/out/success':
             return {'success': True, 'message': 'TV login successful!'}
         elif "That code wasn't right" in response.text:
@@ -677,6 +683,11 @@ class CookieChecker:
                     existing = cookies_collection.find_one({'netflix_id': account_data['netflix_id']})
                     
                     if existing:
+                        # Preserve the is_used status from existing record
+                        account_data['is_used'] = existing.get('is_used', False)
+                        if 'used_at' in existing:
+                            account_data['used_at'] = existing['used_at']
+                        
                         cookies_collection.update_one(
                             {'netflix_id': account_data['netflix_id']},
                             {'$set': {
@@ -688,6 +699,7 @@ class CookieChecker:
                         account_data['created_at'] = datetime.utcnow()
                         account_data['updated_at'] = datetime.utcnow()
                         account_data['added_by'] = self.jobs[job_id]['admin']
+                        account_data['is_used'] = False  # New accounts start as unused
                         cookies_collection.insert_one(account_data)
                 except Exception as e:
                     logger.error(f"Auto-save error: {e}")
@@ -837,8 +849,8 @@ def admin_stats():
         })
         available_quality_stats[quality] = cookies_collection.count_documents({
             'is_valid': True,
-            'video_quality': quality,
-            'is_used': {'$ne': True}
+            'video_quality': quality
+            # Removed is_used filter - all valid accounts are available
         })
     
     total_usage = usage_logs_collection.count_documents({})
@@ -877,8 +889,7 @@ def admin_load_cookies():
     if not netflix_ids:
         return jsonify({'success': False, 'error': 'No Netflix cookies found'})
     
-    
-    
+   
     # Start background job
     job_id = cookie_checker.start_job(netflix_ids, session.get('admin_username', 'admin'), is_recheck=False)
     
@@ -1074,7 +1085,7 @@ def admin_delete_selected():
     })
 
 # -------------------------------------------------------------------
-# PUBLIC API - NO TOKENS REQUIRED
+# PUBLIC API - NO TOKENS REQUIRED (FIXED VERSION)
 # -------------------------------------------------------------------
 
 @app.route('/')
@@ -1086,27 +1097,47 @@ def index():
 def api_login():
     """
     Simple API endpoint - just send quality and TV code
-    It will automatically try accounts until one works
+    It will randomly select an account and try to login
     """
     data = request.get_json(silent=True) or {}
-    quality = data.get('quality', '').upper()
+    quality = data.get('quality', '').strip()
     tv_code = data.get('tv_code', '').strip()
     
-    # Validate inputs
-    if not quality or quality not in VIDEO_QUALITIES:
+    # Normalize quality input
+    if quality:
+        # Handle common variations
+        quality_upper = quality.upper()
+        if quality_upper == 'HD720P':
+            quality_upper = 'HD720p'
+        elif quality_upper == 'HD720':
+            quality_upper = 'HD720p'
+        elif quality_upper == '720P':
+            quality_upper = 'HD720p'
+        elif quality_upper == '720':
+            quality_upper = 'HD720p'
+        
+        # Validate quality
+        if quality_upper not in VIDEO_QUALITIES:
+            return jsonify({
+                'success': False,
+                'error': f'Invalid quality. Must be one of: {", ".join(VIDEO_QUALITIES)}'
+            })
+        quality = quality_upper
+    
+    if not quality:
         return jsonify({
             'success': False,
-            'error': f'Invalid quality. Must be one of: {", ".join(VIDEO_QUALITIES)}'
+            'error': f'Quality required. Must be one of: {", ".join(VIDEO_QUALITIES)}'
         })
     
     if not tv_code or not re.match(r'^\d{8}$', tv_code):
         return jsonify({'success': False, 'error': 'TV code must be 8 digits'})
     
-    # Get all available accounts for this quality
+    # Get all available accounts for this quality (including used ones)
     accounts = list(cookies_collection.find({
         'is_valid': True,
-        'video_quality': quality,
-        'is_used': {'$ne': True}
+        'video_quality': quality
+        # Removed the 'is_used' filter - we want to reuse accounts
     }))
     
     if not accounts:
@@ -1118,7 +1149,7 @@ def api_login():
     # Shuffle accounts to try random ones first
     random.shuffle(accounts)
     
-    # Try each account until successful
+    # Try accounts until we find one that works
     for account in accounts:
         netflix_id = account['netflix_id']
         
@@ -1144,7 +1175,7 @@ def api_login():
             result = perform_tv_login(netflix_session, auth_url, tv_code)
             
             if result['success']:
-                # Log successful usage
+                # Log successful usage (but DON'T mark as used)
                 usage_logs_collection.insert_one({
                     'cookie_id': netflix_id,
                     'account_email': account.get('email', 'Unknown'),
@@ -1154,17 +1185,27 @@ def api_login():
                     'ip': request.remote_addr
                 })
                 
-                # Mark account as used
-                cookies_collection.update_one(
-                    {'netflix_id': netflix_id},
-                    {'$set': {'is_used': True, 'used_at': datetime.utcnow()}}
-                )
+                # Don't mark as used - keep account available for future logins
+                # cookies_collection.update_one(
+                #     {'netflix_id': netflix_id},
+                #     {'$set': {'is_used': True, 'used_at': datetime.utcnow()}}
+                # )
                 
                 return jsonify({
                     'success': True,
                     'message': 'TV login successful!',
                     'account_used': account.get('email', 'Unknown')
                 })
+            else:
+                # Check if it's an invalid code error
+                if "That code wasn't right" in result.get('message', '') or "Invalid TV code" in result.get('message', ''):
+                    # Don't continue trying other accounts - the code is wrong
+                    return jsonify({
+                        'success': False,
+                        'error': 'Invalid TV code. Please check and try again.'
+                    })
+                # Otherwise, try next account
+                continue
             
         except Exception as e:
             logger.error(f"Login error with account {netflix_id}: {e}")
@@ -1183,13 +1224,13 @@ def api_login():
 
 @app.route('/api/accounts/available', methods=['GET'])
 def api_available_accounts():
-    """Get count of available accounts by quality"""
+    """Get count of available accounts by quality (including used ones)"""
     stats = {}
     for quality in VIDEO_QUALITIES:
         stats[quality] = cookies_collection.count_documents({
             'is_valid': True,
-            'video_quality': quality,
-            'is_used': {'$ne': True}
+            'video_quality': quality
+            # Removed the 'is_used' filter - we want to show all valid accounts
         })
     
     return jsonify({
@@ -1198,7 +1239,7 @@ def api_available_accounts():
     })
 
 # -------------------------------------------------------------------
-# ADMIN LOGIN TEMPLATE (unchanged from original)
+# ADMIN LOGIN TEMPLATE
 # -------------------------------------------------------------------
 
 ADMIN_LOGIN_TEMPLATE = '''
@@ -3307,11 +3348,12 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     
     print("=" * 70)
-    print("🎬 NETFLIX TV LOGIN - AUTO-DELETE VERSION")
+    print("🎬 NETFLIX TV LOGIN - FIXED VERSION")
     print("=" * 70)
     print(f"🔥 Video Qualities: SD, HD720p, HD, UHD")
     print(f"🔥 Auto-save: Premium accounts saved immediately")
     print(f"🔥 Auto-delete: Invalid accounts deleted during recheck")
+    print(f"🔥 Accounts persist: Used accounts remain available")
     print(f"🔥 MongoDB: {MONGO_URI}")
     print(f"🔥 Database: {MONGO_DB}")
     print("=" * 70)
@@ -3322,15 +3364,15 @@ if __name__ == "__main__":
     print("📦 API Usage Example:")
     print("  curl -X POST http://localhost:8080/api/login \\")
     print('    -H "Content-Type: application/json" \\')
-    print('    -d \'{"quality": "UHD", "tv_code": "12345678"}\'')
+    print('    -d \'{"quality": "HD720p", "tv_code": "80601083"}\'')
     print("=" * 70)
     print("✅ Features:")
     print("  • No tokens/keys required")
     print("  • Auto-save premium accounts during checking")
     print("  • Auto-delete invalid accounts during recheck")
-    print("  • Bulk and single delete options")
-    print("  • Recheck all accounts at once (auto-deletes invalid)")
-    print("  • Random account selection with auto-retry")
+    print("  • Accounts persist after use (can be reused)")
+    print("  • Stops immediately if TV code is wrong")
+    print("  • HD720p now works correctly")
     print("=" * 70)
     
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True)
